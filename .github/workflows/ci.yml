@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install PyQt6 and ruff
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+          pip install PyQt6 ruff
+
+      # No config file in the repo, so the rules are fixed here.
+      - name: Lint
+        run: ruff check --isolated --select E,F,W,B --line-length 120 kdepad
+
+      - name: Start-up check
+        run: python kdepad --help
+
+      # Pull the embedded KWin script and default config out of the file and
+      # make sure both are well formed.
+      - name: Check the embedded KWin script and config
+        run: |
+          python - <<'PY'
+          import importlib.machinery, importlib.util, pathlib, tomllib
+          loader = importlib.machinery.SourceFileLoader("kdepad", "kdepad")
+          module = importlib.util.module_from_spec(importlib.util.spec_from_loader("kdepad", loader))
+          loader.exec_module(module)
+          tomllib.loads(module.DEFAULT_CONFIG)
+          config = pathlib.Path("default.toml")
+          config.write_text(module.DEFAULT_CONFIG)
+          module.load_config(config)
+          assert module.KWIN_SCRIPT.count("__KDEPAD_CONFIG__") == 1
+          pathlib.Path("kwin-script.js").write_text(module.KWIN_SCRIPT.replace("__KDEPAD_CONFIG__", "{}"))
+          PY
+          node --check kwin-script.js
+
+      - name: Build
+        uses: actions/upload-artifact@v4
+        with:
+          name: kdepad
+          path: kdepad
+          if-no-files-found: error
