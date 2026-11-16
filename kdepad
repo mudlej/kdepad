@@ -1,0 +1,1146 @@
+#!/usr/bin/python3
+"""kdepad: hide windows off every virtual desktop and call them back.
+
+A hidden window keeps running; it is gone from all desktops, the taskbar,
+Alt+Tab, the pager and the Overview until you call it back.
+
+This one file is the whole program for KDE Plasma 6: the tray daemon, the
+command line, the KWin script it loads into KWin (KWIN_SCRIPT below) and the
+default config. It needs PyQt6 and offers to install it when it is missing.
+"""
+# The shebang names the system Python on purpose: that is the one a distro's
+# PyQt6 package installs into.
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import tomllib
+from collections import deque
+from pathlib import Path
+
+# Package manager -> the command that installs PyQt6 with it.
+PYQT_INSTALLERS = {
+    "pacman": ["pacman", "-S", "--needed", "--noconfirm", "python-pyqt6"],
+    "apt-get": ["apt-get", "install", "-y", "python3-pyqt6"],
+    "dnf": ["dnf", "install", "-y", "python3-pyqt6"],
+    "zypper": ["zypper", "--non-interactive", "install", "python3-PyQt6"],
+}
+
+
+def system_dialog(kind, text):
+    """Show a "yesno" question or an "error" box without Qt. None if there is no way to."""
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        return None
+    if shutil.which("kdialog"):
+        return subprocess.run(["kdialog", "--title", "kdepad", f"--{kind}", text]).returncode == 0
+    if shutil.which("zenity"):
+        flag = "--question" if kind == "yesno" else "--error"
+        return subprocess.run(["zenity", flag, "--title=kdepad", f"--text={text}"]).returncode == 0
+    return None
+
+
+def notify(text):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "--app-name=kdepad", "kdepad", text])
+
+
+def offer_pyqt_install(error):
+    """PyQt6 is missing: offer to install it, then start over. Never returns."""
+    in_terminal = sys.stdin.isatty() and sys.stderr.isatty()
+
+    def stop(text):
+        print(f"kdepad: {text}", file=sys.stderr)
+        if not in_terminal and system_dialog("error", text) is None:
+            notify(text)
+        sys.exit(1)
+
+    if os.environ.get("KDEPAD_INSTALLED_PYQT"):
+        stop(f"PyQt6 was installed, but {sys.executable} still cannot load it: {error}")
+    install = next((command for tool, command in PYQT_INSTALLERS.items() if shutil.which(tool)), None)
+    if install is None:
+        stop("PyQt6 for Python 3 is not installed. Install it with your package manager, then start kdepad again.")
+    by_hand = "sudo " + " ".join(install)
+    elevate = "sudo" if in_terminal else "pkexec"
+    if not shutil.which(elevate):
+        stop(f"PyQt6 is not installed. Install it with: {by_hand}")
+
+    if in_terminal:
+        print(f"kdepad needs PyQt6, which is not installed.\nInstall it now with `{by_hand}`? [Y/n] ",
+              end="", file=sys.stderr, flush=True)
+        try:
+            answer = sys.stdin.readline()
+        except KeyboardInterrupt:
+            answer = ""
+        accepted = answer.endswith("\n") and answer.strip().lower() in ("", "y", "yes")
+        if not accepted:
+            sys.exit("kdepad cannot run without PyQt6.")
+    else:
+        accepted = system_dialog("yesno", "kdepad needs PyQt6, which is not installed.\n\n"
+                                          "Install it now? You will be asked for your password.")
+        if accepted is None:
+            stop(f"PyQt6 is not installed. Install it with: {by_hand}")
+        if not accepted:
+            sys.exit(1)
+        notify("Installing PyQt6…")
+
+    if subprocess.run([elevate, *install]).returncode != 0:
+        stop(f"Installing PyQt6 failed. Try it yourself: {by_hand}")
+    os.environ["KDEPAD_INSTALLED_PYQT"] = "1"
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+try:
+    from PyQt6.QtCore import (QCoreApplication, QEvent, QObject, QProcess, QSize, QSocketNotifier,
+                              Qt, QTimer, QUrl, pyqtClassInfo, pyqtSignal, pyqtSlot)
+    from PyQt6.QtDBus import QDBus, QDBusConnection, QDBusMessage, QDBusServiceWatcher
+    from PyQt6.QtGui import QDesktopServices, QIcon
+    from PyQt6.QtWidgets import (QApplication, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                                 QMenu, QSystemTrayIcon, QVBoxLayout, QWidget)
+except ImportError as error:
+    offer_pyqt_install(error)
+
+SERVICE = "org.kdepad.Daemon"
+OBJECT = "/Daemon"
+PLUGIN = "kdepad"
+ME = Path(__file__).resolve()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+CONFIG_PATH = CONFIG_HOME / "kdepad" / "config.toml"
+LAUNCHER = DATA_HOME / "applications" / "kdepad.desktop"
+AUTOSTART = CONFIG_HOME / "autostart" / "kdepad.desktop"
+BIN_LINK = Path.home() / ".local/bin/kdepad"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()) / "kdepad"
+
+DEFAULT_SHORTCUTS = {"stash": "Meta+H", "picker": "Meta+Shift+H", "last": "Meta+Ctrl+H"}
+SHORTCUT_ACTIONS = {"stash": "kdepad_stash", "picker": "kdepad_picker", "last": "kdepad_last"}
+APP_KEYS = {"name", "match", "shortcut", "autostash", "command"}
+
+
+class ConfigError(Exception):
+    pass
+
+
+class BusError(Exception):
+    pass
+
+
+def load_config(path):
+    raw = {}
+    if path.exists():
+        try:
+            raw = tomllib.loads(path.read_text())
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise ConfigError(f"{path}: {error}") from error
+
+    unknown = set(raw) - {"shortcuts", "app"}
+    if unknown:
+        raise ConfigError(f"unknown section '{sorted(unknown)[0]}'; there is [shortcuts] and [[app]]")
+    if not isinstance(raw.get("shortcuts", {}), dict) or not isinstance(raw.get("app", []), list):
+        raise ConfigError("shortcuts go in a [shortcuts] table and each app in its own [[app]] table")
+
+    shortcuts = dict(DEFAULT_SHORTCUTS)
+    for key, value in raw.get("shortcuts", {}).items():
+        if key not in shortcuts:
+            raise ConfigError(f"[shortcuts] has no '{key}'; the keys are stash, picker and last")
+        if not isinstance(value, str):
+            raise ConfigError(f"[shortcuts] {key} must be text such as \"Meta+H\", or \"\" for none")
+        shortcuts[key] = value
+
+    apps = []
+    for number, entry in enumerate(raw.get("app", []), start=1):
+        where = f"[[app]] number {number}"
+        if not isinstance(entry, dict):
+            raise ConfigError("apps are written as [[app]] tables")
+        unknown = set(entry) - APP_KEYS
+        if unknown:
+            raise ConfigError(f"{where}: unknown key '{sorted(unknown)[0]}'")
+        match = entry.get("match")
+        match = [match] if isinstance(match, str) else match
+        if not match or not all(isinstance(item, str) and item for item in match):
+            raise ConfigError(f"{where}: 'match' must name the window class (see `kdepad windows`)")
+        name = entry.get("name") or match[0]
+        shortcut = entry.get("shortcut", "")
+        command = entry.get("command", "")
+        if not all(isinstance(item, str) for item in (name, shortcut, command)):
+            raise ConfigError(f"{where}: name, shortcut and command must be text")
+        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or f"app{number}"
+        action = f"kdepad_app_{slug}"
+        if any(app["action"] == action for app in apps):
+            raise ConfigError(f"{where}: another app is already called '{name}'")
+        apps.append({
+            "name": name,
+            "action": action,
+            "match": [item.lower() for item in match],
+            "shortcut": shortcut,
+            "autostash": bool(entry.get("autostash", False)),
+            "command": command,
+        })
+    return {"shortcuts": shortcuts, "apps": apps}
+
+
+def call(service, path, interface, method, *args, block=True, timeout=3000):
+    message = QDBusMessage.createMethodCall(service, path, interface, method)
+    message.setArguments(list(args))
+    bus = QDBusConnection.sessionBus()
+    if not block:
+        bus.call(message, QDBus.CallMode.NoBlock)
+        return None
+    reply = bus.call(message, QDBus.CallMode.Block, timeout)
+    if reply.type() == QDBusMessage.MessageType.ErrorMessage:
+        raise BusError(f"{method}: {reply.errorMessage()}")
+    values = reply.arguments()
+    return values[0] if values else None
+
+
+def kwin_scripting(method, *args):
+    return call("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", method, *args)
+
+
+def desktop_file_icon(name):
+    data_home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
+    data_dirs = (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    for directory in [data_home, *data_dirs]:
+        for candidate in (name, name.lower()):
+            entry = Path(directory) / "applications" / f"{candidate}.desktop"
+            try:
+                for line in entry.read_text(errors="replace").splitlines():
+                    if line.startswith("Icon="):
+                        return line[5:].strip()
+            except OSError:
+                continue
+    return ""
+
+
+_icons = {}
+
+
+def icon_for(window):
+    key = (window["desktopFile"], window["cls"])
+    if key not in _icons:
+        icon = QIcon()
+        for name in dict.fromkeys(filter(None, (window["desktopFile"], window["cls"], window["name"]))):
+            for candidate in (desktop_file_icon(name), name, name.lower()):
+                if not candidate:
+                    continue
+                icon = QIcon(candidate) if os.path.isabs(candidate) else QIcon.fromTheme(candidate)
+                if not icon.isNull():
+                    break
+            if not icon.isNull():
+                break
+        _icons[key] = icon if not icon.isNull() else QIcon.fromTheme("application-x-executable")
+    return _icons[key]
+
+
+def title_of(window):
+    return window["caption"] or window["app"] or window["cls"] or "Untitled window"
+
+
+class Picker(QWidget):
+    """A type-to-filter list of the hidden windows."""
+
+    chosen = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("kdepad")
+        self.setObjectName("picker")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.setStyleSheet("#picker { border: 1px solid palette(mid); }")
+        self.windows = []
+        self.hint = ""
+
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Type to filter hidden windows")
+        self.filter.setClearButtonEnabled(True)
+        self.filter.textChanged.connect(self.fill)
+        self.filter.installEventFilter(self)
+
+        self.list = QListWidget()
+        self.list.setIconSize(QSize(32, 32))
+        self.list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.list.itemClicked.connect(self.choose)
+
+        self.empty = QLabel()
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty.setWordWrap(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.addWidget(self.filter)
+        layout.addWidget(self.list, 1)
+        layout.addWidget(self.empty, 1)
+        self.resize(560, 420)
+
+    def open(self, windows, hint):
+        self.hint = hint
+        self.filter.clear()
+        self.set_windows(windows)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.filter.setFocus()
+
+    def set_windows(self, windows):
+        self.windows = windows
+        self.fill()
+
+    def fill(self):
+        words = self.filter.text().lower().split()
+        current = self.list.currentItem()
+        keep = current.data(Qt.ItemDataRole.UserRole) if current else None
+        self.list.clear()
+        for window in self.windows:
+            haystack = " ".join((window["caption"], window["cls"], window["app"])).lower()
+            if all(word in haystack for word in words):
+                item = QListWidgetItem(icon_for(window), title_of(window))
+                item.setData(Qt.ItemDataRole.UserRole, window["id"])
+                item.setToolTip(window["cls"])
+                self.list.addItem(item)
+                if window["id"] == keep:
+                    self.list.setCurrentItem(item)
+        if self.list.count() and not self.list.currentItem():
+            self.list.setCurrentRow(0)
+        self.empty.setText("No hidden window matches." if self.windows else self.hint)
+        self.list.setVisible(self.list.count() > 0)
+        self.empty.setVisible(self.list.count() == 0)
+
+    def choose(self, item=None):
+        item = item or self.list.currentItem()
+        if item:
+            self.hide()
+            self.chosen.emit(item.data(Qt.ItemDataRole.UserRole))
+
+    def eventFilter(self, watched, event):
+        if watched is self.filter and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+                QApplication.sendEvent(self.list, event)
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.choose()
+                return True
+            if key == Qt.Key.Key_Escape:
+                self.hide()
+                return True
+        return super().eventFilter(watched, event)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.ActivationChange and self.isVisible() and not self.isActiveWindow():
+            QTimer.singleShot(0, self.hide)
+        super().changeEvent(event)
+
+
+@pyqtClassInfo("D-Bus Interface", SERVICE)
+class Bridge(QObject):
+    """The D-Bus face of the daemon: called by the KWin script and by the CLI."""
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.daemon = daemon
+
+    @pyqtSlot(str)
+    def State(self, payload):
+        self.daemon.on_state(payload)
+
+    @pyqtSlot(result=str)
+    def TakeCommands(self):
+        return self.daemon.take_commands()
+
+    @pyqtSlot()
+    def ShowPicker(self):
+        self.daemon.toggle_picker()
+
+    @pyqtSlot(str)
+    def Launch(self, name):
+        self.daemon.launch(name)
+
+    @pyqtSlot(result=str)
+    def Windows(self):
+        return json.dumps(self.daemon.windows)
+
+    @pyqtSlot(result=str)
+    def Reload(self):
+        return self.daemon.reload()
+
+    @pyqtSlot()
+    def RestoreAll(self):
+        self.daemon.send(op="restore_all")
+
+    @pyqtSlot()
+    def Quit(self):
+        QTimer.singleShot(0, self.daemon.quit)
+
+
+class Daemon(QObject):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.config = {"shortcuts": dict(DEFAULT_SHORTCUTS), "apps": []}
+        self.windows = []
+        self.commands = deque()
+        self.script_file = None
+        self.script_seen = False
+        self.loads = 0
+        self.recovered = False
+        self.quitting = False
+
+        self.picker = Picker()
+        self.picker.chosen.connect(self.show_window)
+
+        self.menu = QMenu()
+        self.tray = QSystemTrayIcon(QIcon.fromTheme("view-hidden"), self)
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self.on_tray_activated)
+
+        self.unanswered = QTimer(self, singleShot=True, interval=1500)
+        self.unanswered.timeout.connect(self.on_unanswered)
+
+        self.kwin_watcher = QDBusServiceWatcher(
+            "org.kde.KWin", QDBusConnection.sessionBus(),
+            QDBusServiceWatcher.WatchModeFlag.WatchForRegistration, self)
+        self.kwin_watcher.serviceRegistered.connect(lambda _: QTimer.singleShot(1000, self.load_script))
+
+    def start(self):
+        bus = QDBusConnection.sessionBus()
+        self.bridge = Bridge(self)
+        if not bus.registerService(SERVICE):
+            sys.exit("kdepad is already running")
+        bus.registerObject(OBJECT, self.bridge, QDBusConnection.RegisterOption.ExportAllSlots)
+
+        try:
+            self.config = load_config(CONFIG_PATH)
+        except ConfigError as error:
+            self.warn(f"Config ignored: {error}")
+        self.refresh()
+        self.show_tray()
+        if bus.interface().isServiceRegistered("org.kde.KWin").value():
+            self.load_script(initial=True)
+        else:
+            print("kdepad: waiting for KWin", file=sys.stderr)
+
+    # --- talking to the user -------------------------------------------------
+
+    def warn(self, text):
+        print(f"kdepad: {text}", file=sys.stderr)
+        if self.tray.isVisible():
+            self.tray.showMessage("kdepad", text, QSystemTrayIcon.MessageIcon.Warning)
+
+    def announce(self, text, tries=0):
+        """Say something once the tray icon is there to say it from."""
+        if self.tray.isVisible():
+            self.tray.showMessage("kdepad", text, QSystemTrayIcon.MessageIcon.Information)
+        elif tries < 10:
+            QTimer.singleShot(1000, lambda: self.announce(text, tries + 1))
+        if not tries:
+            print(f"kdepad: {text}", file=sys.stderr)
+
+    def show_tray(self, tries=0):
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
+        elif tries < 60:
+            QTimer.singleShot(1000, lambda: self.show_tray(tries + 1))
+
+    def hidden(self):
+        return sorted((w for w in self.windows if w["hidden"]), key=lambda w: -w["seq"])
+
+    def stash_hint(self):
+        key = self.config["shortcuts"]["stash"]
+        return f"Nothing is hidden. {key} hides the focused window." if key else "Nothing is hidden."
+
+    def refresh(self):
+        hidden = self.hidden()
+        self.menu.clear()
+        for window in hidden:
+            title = title_of(window)
+            title = title if len(title) <= 60 else title[:59] + "…"
+            action = self.menu.addAction(icon_for(window), title.replace("&", "&&"))
+            action.triggered.connect(lambda _=False, window_id=window["id"]: self.show_window(window_id))
+        if not hidden:
+            self.menu.addAction("Nothing hidden").setEnabled(False)
+        self.menu.addSeparator()
+        self.menu.addAction("Bring everything back", lambda: self.send(op="restore_all")).setEnabled(bool(hidden))
+        self.menu.addAction("Reload config", self.reload)
+        self.menu.addAction("Edit config", self.edit_config)
+        self.menu.addAction("Quit kdepad", self.quit)
+        count = len(hidden)
+        self.tray.setToolTip(f"kdepad: {count} hidden window{'' if count == 1 else 's'}")
+        if self.picker.isVisible():
+            self.picker.set_windows(hidden)
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggle_picker()
+
+    def toggle_picker(self):
+        if self.picker.isVisible():
+            self.picker.hide()
+        else:
+            self.picker.open(self.hidden(), self.stash_hint())
+
+    def edit_config(self):
+        if not CONFIG_PATH.exists():
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(DEFAULT_CONFIG)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(CONFIG_PATH)))
+
+    def launch(self, name):
+        command = next((app["command"] for app in self.config["apps"] if app["name"] == name), "")
+        try:
+            parts = shlex.split(command)
+        except ValueError as error:
+            parts = []
+            self.warn(f"Bad command for {name}: {error}")
+        if parts and not QProcess.startDetached(parts[0], parts[1:])[0]:
+            self.warn(f"Could not start {name}: {command}")
+
+    # --- talking to KWin -----------------------------------------------------
+
+    def load_script(self, initial=False):
+        """(Re)load the KWin script with the current config baked in."""
+        apps = [{**app, "canLaunch": bool(app["command"])} for app in self.config["apps"]]
+        payload = {"initial": initial, "shortcuts": self.config["shortcuts"], "apps": apps}
+        try:
+            source = KWIN_SCRIPT.replace("__KDEPAD_CONFIG__", json.dumps(payload))
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            self.loads += 1
+            previous, self.script_file = self.script_file, RUNTIME_DIR / f"kdepad-{os.getpid()}-{self.loads}.js"
+            self.script_file.write_text(source)
+            if previous:
+                previous.unlink(missing_ok=True)
+        except OSError as error:
+            self.warn(f"Could not prepare the KWin script: {error}")
+            return
+        self.script_seen = False
+        try:
+            kwin_scripting("unloadScript", PLUGIN)
+        except BusError as error:
+            self.warn(f"KWin is not answering: {error}")
+            return
+        # KWin keeps whatever key an action had before. Forget the keys the
+        # config sets so the config file is what decides them.
+        keyed = [SHORTCUT_ACTIONS[k] for k, v in self.config["shortcuts"].items() if v]
+        keyed += [app["action"] for app in apps if app["shortcut"]]
+        for action in keyed:
+            try:
+                call("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel", "unregister", "kwin", action)
+            except BusError:
+                pass
+        self.try_load(self.script_file)
+
+    def try_load(self, path, attempt=0):
+        if path != self.script_file:
+            return
+        try:
+            script_id = kwin_scripting("loadScript", str(path), PLUGIN)
+            if script_id is not None and script_id < 0:
+                # The previous copy has not finished unloading yet.
+                if attempt < 20:
+                    QTimer.singleShot(100, lambda: self.try_load(path, attempt + 1))
+                else:
+                    self.warn("KWin would not replace the old kdepad script")
+                return
+            kwin_scripting("start")
+        except BusError as error:
+            self.warn(f"KWin did not load the script: {error}")
+            return
+        QTimer.singleShot(4000, lambda: self.check_script(path))
+
+    def check_script(self, path):
+        if path == self.script_file and not self.script_seen:
+            self.warn("The KWin script did not start. Look for errors with: "
+                      "journalctl --user -b | grep -i -e kdepad -e kwin_scripting")
+
+    def send(self, **command):
+        self.commands.append(command)
+        call("org.kde.kglobalaccel", "/component/kwin", "org.kde.kglobalaccel.Component",
+             "invokeShortcut", "kdepad_command", block=False)
+        self.unanswered.start()
+
+    def take_commands(self):
+        self.script_seen = True
+        commands = list(self.commands)
+        self.commands.clear()
+        self.unanswered.stop()
+        return json.dumps(commands)
+
+    def on_unanswered(self):
+        if not self.commands or self.quitting:
+            return
+        if self.recovered:
+            self.commands.clear()
+            self.warn("KWin is not reacting to kdepad. Try \"Reload config\" from this menu.")
+        else:
+            # A freshly loaded script collects pending commands when it starts.
+            self.recovered = True
+            self.load_script()
+
+    def on_state(self, payload):
+        self.script_seen = True
+        try:
+            self.windows = json.loads(payload)["windows"]
+        except (ValueError, KeyError, TypeError):
+            return
+        self.refresh()
+        if self.quitting and not self.hidden():
+            self.finish_quit()
+
+    def show_window(self, window_id):
+        self.send(op="show", id=window_id)
+
+    def reload(self):
+        try:
+            self.config = load_config(CONFIG_PATH)
+        except ConfigError as error:
+            self.warn(f"Config not reloaded: {error}")
+            return str(error)
+        self.recovered = False
+        self.load_script()
+        self.refresh()
+        return ""
+
+    def quit(self):
+        """Bring every hidden window back, then leave."""
+        if self.quitting:
+            return
+        self.quitting = True
+        self.picker.hide()
+        if self.hidden():
+            self.send(op="restore_all")
+            QTimer.singleShot(1500, self.finish_quit)
+        else:
+            self.finish_quit()
+
+    def finish_quit(self):
+        if self.script_file:
+            try:
+                kwin_scripting("unloadScript", PLUGIN)
+            except BusError:
+                pass
+            self.script_file.unlink(missing_ok=True)
+            self.script_file = None
+        self.app.quit()
+
+
+def run_daemon():
+    try:
+        first_run = register()
+    except OSError as error:
+        first_run = False
+        print(f"kdepad: could not set up autostart: {error}", file=sys.stderr)
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("kdepad")
+    app.setDesktopFileName("kdepad")
+    app.setQuitOnLastWindowClosed(False)
+    if not QDBusConnection.sessionBus().isConnected():
+        sys.exit("kdepad: no D-Bus session bus")
+    daemon = Daemon(app)
+
+    # Qt's event loop does not run Python signal handlers on its own; a byte on
+    # this socket wakes it up when a signal arrives.
+    reader, writer = socket.socketpair()
+    writer.setblocking(False)
+    signal.set_wakeup_fd(writer.fileno())
+    notifier = QSocketNotifier(reader.fileno(), QSocketNotifier.Type.Read)
+    notifier.activated.connect(lambda: reader.recv(64))
+    for number in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(number, lambda *_: QTimer.singleShot(0, daemon.quit))
+
+    daemon.start()
+    if first_run:
+        daemon.announce("Set up to start at login from now on. `kdepad uninstall` undoes that.")
+    return app.exec()
+
+
+def daemon_running():
+    return QDBusConnection.sessionBus().interface().isServiceRegistered(SERVICE).value()
+
+
+def run_client(command):
+    if not daemon_running():
+        sys.exit("kdepad is not running. Start it with: kdepad")
+    method = {"windows": "Windows", "pick": "ShowPicker", "reload": "Reload",
+              "restore": "RestoreAll", "quit": "Quit"}[command]
+    try:
+        result = call(SERVICE, OBJECT, SERVICE, method)
+    except BusError as error:
+        sys.exit(f"kdepad: {error}")
+    if command == "reload" and result:
+        sys.exit(f"kdepad: {result}")
+    if command == "windows":
+        windows = sorted(json.loads(result), key=lambda w: (not w["hidden"], w["cls"].lower()))
+        if not windows:
+            print("No windows reported yet.")
+            return 0
+        width = max(len(w["cls"]) for w in windows)
+        print(f"{'':6}  {'CLASS':{width}}  TITLE")
+        for w in windows:
+            print(f"{'hidden' if w['hidden'] else '':6}  {w['cls']:{width}}  {w['caption']}")
+        print("\nUse a CLASS value as `match` in", CONFIG_PATH)
+    return 0
+
+
+def register():
+    """Add this file to the app launcher, login autostart and PATH, where it is.
+
+    Nothing is copied. Does nothing and returns False when the launcher entry
+    already points here, so removing only the autostart entry sticks.
+    """
+    quoted = str(ME)
+    for char in '\\"$`':
+        quoted = quoted.replace(char, "\\" + char)
+    entry = ("[Desktop Entry]\nType=Application\nName=kdepad\n"
+             "Comment=Hide windows off every desktop and call them back\n"
+             f'Exec="{quoted}"\nIcon=view-hidden\nCategories=Utility;\nStartupNotify=false\n')
+    try:
+        if LAUNCHER.read_text() == entry:
+            return False
+    except OSError:
+        pass
+    for path in (LAUNCHER, AUTOSTART):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(entry)
+    BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
+    if BIN_LINK.is_symlink() or not BIN_LINK.exists():
+        BIN_LINK.unlink(missing_ok=True)
+        BIN_LINK.symlink_to(ME)
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(DEFAULT_CONFIG)
+    return True
+
+
+def uninstall():
+    if daemon_running():
+        call(SERVICE, OBJECT, SERVICE, "Quit")
+    for path in (LAUNCHER, AUTOSTART):
+        path.unlink(missing_ok=True)
+    if BIN_LINK.is_symlink():
+        BIN_LINK.unlink()
+    print(f"kdepad no longer starts at login. Left in place: {ME} and {CONFIG_PATH}\n"
+          "Running it again sets it up again.")
+    return 0
+
+
+USAGE = """\
+commands:
+  (none)      run the tray daemon; the first run also sets it up to start at
+              login, adds it to the app launcher and puts `kdepad` on PATH
+  uninstall   undo that setup (hidden windows come back first)
+  windows     list open windows with their class and whether they are hidden
+  pick        open the list of hidden windows
+  reload      re-read the config
+  restore     bring every hidden window back
+  quit        restore, then stop the daemon
+
+default keys (change them in the config):
+  Meta+H          hide the focused window
+  Meta+Shift+H    list the hidden windows; type to filter, Enter to pick
+  Meta+Ctrl+H     bring back the most recently hidden window
+
+The tray icon does the same with the mouse. A window you bring back lands on
+the desktop you are on. Quitting kdepad brings every hidden window back.
+
+Config: ~/.config/kdepad/config.toml (tray menu > Edit config). It also sets
+per-app show/hide keys and apps that hide as soon as they open. A key that
+another shortcut already owns is silently not assigned; pick another one.
+Script errors: journalctl --user -b | grep -i -e kdepad -e kwin_scripting
+"""
+
+DEFAULT_CONFIG = """\
+# kdepad config. After editing: `kdepad reload`, or "Reload config" in the tray menu.
+#
+# Keys are written the way System Settings shows them: "Meta+H", "Ctrl+Alt+M".
+# Use "" for no key. A key that another shortcut already owns is silently not
+# assigned, so if a key does nothing, pick another one.
+
+[shortcuts]
+stash  = "Meta+H"        # hide the focused window
+picker = "Meta+Shift+H"  # list the hidden windows and pick one
+last   = "Meta+Ctrl+H"   # bring back the most recently hidden window
+
+# One [[app]] block per app that gets its own show/hide key.
+# Find `match` with `kdepad windows` while the app is open (the CLASS column).
+#
+# [[app]]
+# name      = "Music"       # shown in System Settings and messages
+# match     = "spotify"     # window class; a list works too: ["a", "b"]
+# shortcut  = "Meta+S"      # hides the app when focused, otherwise brings it to you
+# autostash = true          # hide its window as soon as it opens
+# command   = "spotify"     # started by the shortcut when the app is not running
+"""
+
+# The half of kdepad that runs inside KWin. The daemon loads it over D-Bus with
+# __KDEPAD_CONFIG__ replaced by the config. It owns the shortcuts and does the
+# hiding: a hidden window is minimized and flagged to skip the taskbar, the
+# pager and the window switcher. Those four properties are the only record of
+# "hidden", so a freshly loaded copy picks up windows hidden by an earlier one.
+KWIN_SCRIPT = r'''
+var CONFIG = __KDEPAD_CONFIG__;
+
+var SERVICE = "org.kdepad.Daemon";
+var OBJECT = "/Daemon";
+var OWN_CLASS = "kdepad";
+var NEW_WINDOW_MS = 5000;
+var LAUNCH_MS = 60000;
+
+var hidden = {};     // window id -> {window, saved flags, seq}
+var hideSeq = 0;
+var fresh = {};      // window id -> time it appeared, until its app is known
+var launching = {};  // app index -> time we asked the daemon to start it
+var published = {};  // window ids in the last state sent to the daemon
+
+function wid(w) { return String(w.internalId); }
+function lower(s) { return String(s || "").toLowerCase(); }
+
+function allWindows() {
+    var list = workspace.windowList(), out = [];
+    for (var i = 0; i < list.length; i++) {
+        out.push(list[i]);
+    }
+    return out;
+}
+
+function isOwn(w) {
+    return lower(w.resourceClass) === OWN_CLASS || lower(w.desktopFileName) === OWN_CLASS;
+}
+
+// Application windows, as opposed to panels, menus, tooltips and the like.
+function ordinary(w) {
+    return !!w && w.managed && !w.deleted && !w.specialWindow
+        && (w.normalWindow || w.dialog || w.utility);
+}
+
+function eligible(w) {
+    return ordinary(w) && !isOwn(w);
+}
+
+// A dialog is hidden together with the window it belongs to.
+function root(w) {
+    var hops = 0;
+    while (w && w.transient && w.transientFor && hops++ < 16) {
+        w = w.transientFor;
+    }
+    return w;
+}
+
+function appOf(w) {
+    var keys = [lower(w.resourceClass), lower(w.resourceName), lower(w.desktopFileName)];
+    for (var a = 0; a < CONFIG.apps.length; a++) {
+        var match = CONFIG.apps[a].match;
+        for (var m = 0; m < match.length; m++) {
+            if (keys.indexOf(match[m]) >= 0) {
+                return a;
+            }
+        }
+    }
+    return -1;
+}
+
+function appWindows(a) {
+    return allWindows().filter(function (w) {
+        return eligible(w) && !w.transient && appOf(w) === a;
+    });
+}
+
+function restoreFlags(w, saved) {
+    w.skipTaskbar = saved.skipTaskbar;
+    w.skipPager = saved.skipPager;
+    w.skipSwitcher = saved.skipSwitcher;
+}
+
+function hide(w) {
+    w = root(w);
+    if (!eligible(w) || hidden[wid(w)]) {
+        return false;
+    }
+    var saved = {skipTaskbar: w.skipTaskbar, skipPager: w.skipPager, skipSwitcher: w.skipSwitcher};
+    w.skipTaskbar = true;
+    w.skipPager = true;
+    w.skipSwitcher = true;
+    w.minimized = true;
+    if (!w.minimized) {  // KWin refused, e.g. a window rule forbids minimizing
+        restoreFlags(w, saved);
+        return false;
+    }
+    hidden[wid(w)] = {window: w, saved: saved, seq: ++hideSeq};
+    return true;
+}
+
+function forget(w) {
+    var entry = hidden[wid(w)];
+    if (entry) {
+        delete hidden[wid(w)];
+        restoreFlags(w, entry.saved);
+    }
+    return !!entry;
+}
+
+function bringHere(w) {
+    var activity = workspace.currentActivity;
+    if (activity && w.activities.length > 0 && w.activities.indexOf(activity) < 0) {
+        w.activities = [activity];
+    }
+    if (!w.onAllDesktops) {
+        w.desktops = [workspace.currentDesktop];
+    }
+}
+
+function show(w) {
+    forget(w);
+    bringHere(w);
+    if (w.minimized) {
+        w.minimized = false;
+    }
+    workspace.activeWindow = w;
+}
+
+function hiddenByAge() {
+    var entries = [];
+    for (var id in hidden) {
+        entries.push(hidden[id]);
+    }
+    entries.sort(function (x, y) { return y.seq - x.seq; });
+    return entries;
+}
+
+function showLast() {
+    var entries = hiddenByAge();
+    if (entries.length) {
+        show(entries[0].window);
+    }
+}
+
+function restoreAll() {
+    hiddenByAge().forEach(function (entry) {
+        forget(entry.window);
+        entry.window.minimized = false;
+    });
+}
+
+function toggleApp(a) {
+    var windows = appWindows(a);
+    if (!windows.length) {
+        if (CONFIG.apps[a].canLaunch) {
+            launching[a] = Date.now();
+            callDBus(SERVICE, OBJECT, SERVICE, "Launch", CONFIG.apps[a].name);
+        }
+        return;
+    }
+    var away = windows.filter(function (w) { return !!hidden[wid(w)]; });
+    if (away.length) {
+        away.forEach(show);
+        return;
+    }
+    var active = workspace.activeWindow ? root(workspace.activeWindow) : null;
+    if (active && eligible(active) && appOf(active) === a) {
+        windows.forEach(hide);
+        return;
+    }
+    // Open but not in front of you (other desktop, buried, minimized): fetch
+    // the topmost one instead of hiding something you may not be looking at.
+    var order = workspace.stackingOrder, top = windows[0];
+    for (var i = 0; i < order.length; i++) {
+        if (eligible(order[i]) && !order[i].transient && appOf(order[i]) === a) {
+            top = order[i];
+        }
+    }
+    show(top);
+}
+
+function publish(skipId) {
+    var windows = [];
+    published = {};
+    allWindows().forEach(function (w) {
+        var id = wid(w);
+        if (id === skipId || !eligible(w) || (w.transient && !hidden[id])) {
+            return;
+        }
+        published[id] = true;
+        var a = appOf(w);
+        windows.push({
+            id: id,
+            cls: String(w.resourceClass),
+            name: String(w.resourceName),
+            desktopFile: String(w.desktopFileName),
+            caption: String(w.caption),
+            app: a >= 0 ? CONFIG.apps[a].name : "",
+            hidden: !!hidden[id],
+            seq: hidden[id] ? hidden[id].seq : 0
+        });
+    });
+    callDBus(SERVICE, OBJECT, SERVICE, "State", JSON.stringify({windows: windows}));
+}
+
+// The picker is an ordinary window with no say over its own focus on Wayland,
+// so it is put in front from here.
+function adoptPicker(w) {
+    w.skipTaskbar = true;
+    w.skipPager = true;
+    w.skipSwitcher = true;
+    w.keepAbove = true;
+    workspace.activeWindow = w;
+}
+
+// Runs when a window appears and again if its class arrives late.
+function classify(w) {
+    var id = wid(w);
+    if (!fresh[id]) {
+        return;
+    }
+    if (Date.now() - fresh[id] > NEW_WINDOW_MS) {
+        delete fresh[id];
+        return;
+    }
+    if (isOwn(w)) {
+        delete fresh[id];
+        adoptPicker(w);
+        return;
+    }
+    var a = appOf(w);
+    if (a < 0) {
+        return;
+    }
+    delete fresh[id];
+    if (!CONFIG.apps[a].autostash || !w.normalWindow || w.transient) {
+        return;
+    }
+    if (launching[a] && Date.now() - launching[a] < LAUNCH_MS) {
+        delete launching[a];  // you just asked for this app, so let it show
+        return;
+    }
+    var onShow = appWindows(a).filter(function (other) {
+        return wid(other) !== id && !hidden[wid(other)];
+    });
+    if (!onShow.length && hide(w)) {
+        publish();
+    }
+}
+
+function track(w) {
+    w.minimizedChanged.connect(function () {
+        // Something else brought it back (its tray icon, a notification).
+        if (!w.minimized && forget(w)) {
+            publish();
+        }
+    });
+    w.captionChanged.connect(function () {
+        if (hidden[wid(w)]) {
+            publish();
+        }
+    });
+    w.windowClassChanged.connect(function () {
+        classify(w);
+    });
+}
+
+function runCommands(json) {
+    var commands = [];
+    try {
+        commands = JSON.parse(json);
+    } catch (e) {
+        print("kdepad: bad command list: " + json);
+    }
+    commands.forEach(function (command) {
+        if (command.op === "show") {
+            var entry = hidden[command.id];
+            if (entry) {
+                show(entry.window);
+            }
+        } else if (command.op === "restore_all") {
+            restoreAll();
+        }
+    });
+    publish();
+}
+
+function fetchCommands() {
+    callDBus(SERVICE, OBJECT, SERVICE, "TakeCommands", runCommands);
+}
+
+workspace.windowAdded.connect(function (w) {
+    if (!ordinary(w)) {
+        return;
+    }
+    track(w);
+    fresh[wid(w)] = Date.now();
+    classify(w);
+    publish();
+});
+
+workspace.windowRemoved.connect(function (w) {
+    var id = wid(w);
+    delete hidden[id];
+    delete fresh[id];
+    if (published[id]) {
+        publish(id);
+    }
+});
+
+registerShortcut("kdepad_stash", "kdepad: Hide the active window", CONFIG.shortcuts.stash, function () {
+    if (workspace.activeWindow && hide(workspace.activeWindow)) {
+        publish();
+    }
+});
+registerShortcut("kdepad_last", "kdepad: Bring back the last hidden window", CONFIG.shortcuts.last, function () {
+    showLast();
+    publish();
+});
+registerShortcut("kdepad_picker", "kdepad: List hidden windows", CONFIG.shortcuts.picker, function () {
+    callDBus(SERVICE, OBJECT, SERVICE, "ShowPicker");
+});
+CONFIG.apps.forEach(function (app, a) {
+    registerShortcut(app.action, "kdepad: Show/hide " + app.name, app.shortcut, function () {
+        toggleApp(a);
+        publish();
+    });
+});
+// The daemon triggers this by name to make the script collect its commands.
+registerShortcut("kdepad_command", "kdepad: internal, leave unassigned", "", fetchCommands);
+
+allWindows().forEach(function (w) {
+    if (!ordinary(w)) {
+        return;
+    }
+    track(w);
+    if (eligible(w) && w.minimized && w.skipTaskbar && w.skipPager && w.skipSwitcher) {
+        hidden[wid(w)] = {
+            window: w,
+            saved: {skipTaskbar: false, skipPager: false, skipSwitcher: false},
+            seq: ++hideSeq
+        };
+    } else if (CONFIG.initial && eligible(w) && w.normalWindow && !w.transient) {
+        var a = appOf(w);
+        if (a >= 0 && CONFIG.apps[a].autostash) {
+            hide(w);
+        }
+    }
+});
+fetchCommands();
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="kdepad", description=__doc__.split("\n\n")[0], epilog=USAGE,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("command", nargs="?", default="daemon", metavar="command",
+                        choices=["daemon", "uninstall", "windows", "pick", "reload", "restore", "quit"])
+    command = parser.parse_args().command
+    if command == "daemon":
+        return run_daemon()
+    app = QCoreApplication(sys.argv[:1])  # noqa: F841 (QtDBus wants an application object)
+    if command == "uninstall":
+        return uninstall()
+    return run_client(command)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
