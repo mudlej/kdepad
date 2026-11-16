@@ -781,7 +781,7 @@ last   = "Meta+Ctrl+H"   # bring back the most recently hidden window
 # The half of kdepad that runs inside KWin. The daemon loads it over D-Bus with
 # __KDEPAD_CONFIG__ replaced by the config. It owns the shortcuts and does the
 # hiding: a hidden window is minimized and flagged to skip the taskbar, the
-# pager and the window switcher. Those four properties are the only record of
+# pager and the window switcher. Those window properties are the only record of
 # "hidden", so a freshly loaded copy picks up windows hidden by an earlier one.
 KWIN_SCRIPT = r'''
 var CONFIG = __KDEPAD_CONFIG__;
@@ -857,21 +857,40 @@ function restoreFlags(w, saved) {
     w.skipSwitcher = saved.skipSwitcher;
 }
 
+// Hidden windows get their flags set again whenever they change. KWin itself
+// puts an XWayland window back in the taskbar each time it re-evaluates the
+// window's visibility (when it is minimized, on a desktop switch), and an app
+// can change the flags too.
+function enforce(w) {
+    if (!w.skipTaskbar) {
+        w.skipTaskbar = true;
+    }
+    if (!w.skipPager) {
+        w.skipPager = true;
+    }
+    if (!w.skipSwitcher) {
+        w.skipSwitcher = true;
+    }
+}
+
 function hide(w) {
     w = root(w);
     if (!eligible(w) || hidden[wid(w)]) {
         return false;
     }
-    var saved = {skipTaskbar: w.skipTaskbar, skipPager: w.skipPager, skipSwitcher: w.skipSwitcher};
-    w.skipTaskbar = true;
-    w.skipPager = true;
-    w.skipSwitcher = true;
+    // Recorded before minimizing, so that enforce() already applies while KWin
+    // minimizes the window.
+    hidden[wid(w)] = {
+        window: w,
+        saved: {skipTaskbar: w.skipTaskbar, skipPager: w.skipPager, skipSwitcher: w.skipSwitcher},
+        seq: ++hideSeq
+    };
+    enforce(w);
     w.minimized = true;
     if (!w.minimized) {  // KWin refused, e.g. a window rule forbids minimizing
-        restoreFlags(w, saved);
+        forget(w);
         return false;
     }
-    hidden[wid(w)] = {window: w, saved: saved, seq: ++hideSeq};
     return true;
 }
 
@@ -1040,6 +1059,14 @@ function track(w) {
     w.windowClassChanged.connect(function () {
         classify(w);
     });
+    var keepHidden = function () {
+        if (hidden[wid(w)]) {
+            enforce(w);
+        }
+    };
+    w.skipTaskbarChanged.connect(keepHidden);
+    w.skipPagerChanged.connect(keepHidden);
+    w.skipSwitcherChanged.connect(keepHidden);
 }
 
 function runCommands(json) {
@@ -1111,12 +1138,14 @@ allWindows().forEach(function (w) {
         return;
     }
     track(w);
-    if (eligible(w) && w.minimized && w.skipTaskbar && w.skipPager && w.skipSwitcher) {
+    // Not the taskbar flag: KWin may have reset it while no script was loaded.
+    if (eligible(w) && w.minimized && w.skipPager && w.skipSwitcher) {
         hidden[wid(w)] = {
             window: w,
             saved: {skipTaskbar: false, skipPager: false, skipSwitcher: false},
             seq: ++hideSeq
         };
+        enforce(w);
     } else if (CONFIG.initial && eligible(w) && w.normalWindow && !w.transient) {
         var a = appOf(w);
         if (a >= 0 && CONFIG.apps[a].autostash) {
