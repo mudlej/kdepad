@@ -1,10 +1,5 @@
 # kdepad
 
-<!-- Screenshot of the picker window goes here. Add screenshot.png to the repo,
-     then move the next line out of this comment:
-![The kdepad picker listing hidden windows](screenshot.png)
--->
-
 Hide running windows off every virtual desktop on KDE Plasma 6, and call them
 back when you want them.
 
@@ -12,9 +7,10 @@ A hidden window keeps running. It is gone from all desktops, the taskbar,
 Alt+Tab, the pager and the Overview until you call it back.
 
 ## Screenshots
-<img width="1170" height="922" alt="Screenshot_20261116_161441" src="https://github.com/user-attachments/assets/e4587dc1-f184-4228-bbbd-608fd122e5b3" />
-<img width="753" height="465" alt="Screenshot_20261116_161523" src="https://github.com/user-attachments/assets/f27c5b64-5dd3-4ed7-83a2-702fd353acb0" />
 
+| Picker | Tray menu |
+| :---: | :---: |
+| <img width="380" alt="The picker: a filter box above a list of three hidden windows" src="https://github.com/user-attachments/assets/e4587dc1-f184-4228-bbbd-608fd122e5b3" /> | <img width="380" alt="The tray menu: the hidden windows, then Bring everything back, Reload config, Edit config and Quit" src="https://github.com/user-attachments/assets/f27c5b64-5dd3-4ed7-83a2-702fd353acb0" /> |
 
 ## Install
 
