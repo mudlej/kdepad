@@ -18,7 +18,7 @@ kdepad is one file. It needs Plasma 6 and PyQt6, and offers to install PyQt6
 if it is missing.
 
 ```sh
-curl -LO https://raw.githubusercontent.com/mudlej/kdepad/main/kdepad
+curl -LO https://github.com/mudlej/kdepad/releases/latest/download/kdepad
 chmod +x kdepad
 ./kdepad
 ```

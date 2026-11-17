@@ -108,6 +108,7 @@ try:
 except ImportError as error:
     offer_pyqt_install(error)
 
+VERSION = "0.1.0"  # a release is the tag v<VERSION> with this file attached
 SERVICE = "org.kdepad.Daemon"
 OBJECT = "/Daemon"
 PLUGIN = "kdepad"
@@ -1161,6 +1162,7 @@ fetchCommands();
 def main():
     parser = argparse.ArgumentParser(prog="kdepad", description=__doc__.split("\n\n")[0], epilog=USAGE,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"kdepad {VERSION}")
     parser.add_argument("command", nargs="?", default="daemon", metavar="command",
                         choices=["daemon", "uninstall", "windows", "pick", "reload", "restore", "quit"])
     command = parser.parse_args().command
