@@ -11,6 +11,11 @@ back when you want them.
 A hidden window keeps running. It is gone from all desktops, the taskbar,
 Alt+Tab, the pager and the Overview until you call it back.
 
+## Screenshots
+<img width="1170" height="922" alt="Screenshot_20261116_161441" src="https://github.com/user-attachments/assets/e4587dc1-f184-4228-bbbd-608fd122e5b3" />
+<img width="753" height="465" alt="Screenshot_20261116_161523" src="https://github.com/user-attachments/assets/f27c5b64-5dd3-4ed7-83a2-702fd353acb0" />
+
+
 ## Install
 
 kdepad is one file. It needs Plasma 6 and PyQt6, and offers to install PyQt6
