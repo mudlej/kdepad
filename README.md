@@ -14,7 +14,7 @@ The picker, as a grid of thumbnails and as a list:
   <img width="720" alt="The picker showing the hidden windows" src="https://github.com/user-attachments/assets/6a3885b9-fe00-46a8-af6a-0c74a610869f" />
 </p>
 <p align="center">
-  <img width="720" alt="The picker showing the hidden windows, in its other view" src="https://github.com/user-attachments/assets/37a93328-d7c5-470e-97b9-49d012726af5" />
+  <img width="720" alt="The picker showing the hidden windows, in its other view" src="https://github.com/user-attachments/assets/dbce5686-11f8-49d6-b9ee-e37e85c9d6f0" />
 </p>
 
 The tray menu:
