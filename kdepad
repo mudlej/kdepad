@@ -13,6 +13,7 @@ default config. It needs PyQt6 and offers to install it when it is missing.
 # PyQt6 package installs into.
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -99,23 +100,27 @@ def offer_pyqt_install(error):
 
 
 try:
-    from PyQt6.QtCore import (QCoreApplication, QEvent, QObject, QProcess, QSize, QSocketNotifier,
-                              Qt, QTimer, QUrl, pyqtClassInfo, pyqtSignal, pyqtSlot)
-    from PyQt6.QtDBus import QDBus, QDBusConnection, QDBusMessage, QDBusServiceWatcher
-    from PyQt6.QtGui import QDesktopServices, QIcon
-    from PyQt6.QtWidgets import (QApplication, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                                 QMenu, QSystemTrayIcon, QVBoxLayout, QWidget)
+    from PyQt6.QtCore import (QCoreApplication, QEvent, QObject, QPointF, QProcess, QRect, QRectF, QSize,
+                              QSocketNotifier, Qt, QTimer, QUrl, pyqtClassInfo, pyqtSignal, pyqtSlot)
+    from PyQt6.QtDBus import (QDBus, QDBusConnection, QDBusMessage, QDBusPendingCallWatcher,
+                              QDBusPendingReply, QDBusServiceWatcher, QDBusUnixFileDescriptor)
+    from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
+    from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
+                                 QListWidget, QListWidgetItem, QMenu, QSlider, QStyle, QStyledItemDelegate,
+                                 QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 except ImportError as error:
     offer_pyqt_install(error)
 
-VERSION = "0.1.0"  # a release is the tag v<VERSION> with this file attached
+VERSION = "0.2.0"  # a release is the tag v<VERSION> with this file attached
 SERVICE = "org.kdepad.Daemon"
 OBJECT = "/Daemon"
 PLUGIN = "kdepad"
 ME = Path(__file__).resolve()
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
 CONFIG_PATH = CONFIG_HOME / "kdepad" / "config.toml"
+STATE_PATH = STATE_HOME / "kdepad" / "picker.json"  # the picker's sizes, as you left them
 LAUNCHER = DATA_HOME / "applications" / "kdepad.desktop"
 AUTOSTART = CONFIG_HOME / "autostart" / "kdepad.desktop"
 BIN_LINK = Path.home() / ".local/bin/kdepad"
@@ -124,6 +129,27 @@ RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()) /
 DEFAULT_SHORTCUTS = {"stash": "Meta+H", "picker": "Meta+Shift+H", "last": "Meta+Ctrl+H"}
 SHORTCUT_ACTIONS = {"stash": "kdepad_stash", "picker": "kdepad_picker", "last": "kdepad_last"}
 APP_KEYS = {"name", "match", "shortcut", "autostash", "command"}
+PICKER_VIEWS = ("list", "grid")
+THUMB_WIDTHS = (160, 320, 480)  # of a thumbnail in the grid: smallest, to start with, largest
+THUMB_STEP = 20
+SHADOW = 20  # room around the picker for its shadow; it is also where the picker is resized from
+RESIZE_CURSORS = {
+    Qt.Edge.LeftEdge: Qt.CursorShape.SizeHorCursor,
+    Qt.Edge.RightEdge: Qt.CursorShape.SizeHorCursor,
+    Qt.Edge.TopEdge: Qt.CursorShape.SizeVerCursor,
+    Qt.Edge.BottomEdge: Qt.CursorShape.SizeVerCursor,
+    Qt.Edge.LeftEdge | Qt.Edge.TopEdge: Qt.CursorShape.SizeFDiagCursor,
+    Qt.Edge.RightEdge | Qt.Edge.BottomEdge: Qt.CursorShape.SizeFDiagCursor,
+    Qt.Edge.RightEdge | Qt.Edge.TopEdge: Qt.CursorShape.SizeBDiagCursor,
+    Qt.Edge.LeftEdge | Qt.Edge.BottomEdge: Qt.CursorShape.SizeBDiagCursor,
+}
+
+# KWin's screenshot interface: service, object and the errors that only say
+# "not this window" or "not this time".
+SHOTS = "org.kde.KWin.ScreenShot2"
+SHOTS_OBJECT = "/org/kde/KWin/ScreenShot2"
+SHOTS_PASSING_ERRORS = (f"{SHOTS}.Error.Cancelled", f"{SHOTS}.Error.InvalidWindow",
+                        "org.freedesktop.DBus.Error.NoReply")
 
 
 class ConfigError(Exception):
@@ -142,11 +168,13 @@ def load_config(path):
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise ConfigError(f"{path}: {error}") from error
 
-    unknown = set(raw) - {"shortcuts", "app"}
+    unknown = set(raw) - {"shortcuts", "picker", "app"}
     if unknown:
-        raise ConfigError(f"unknown section '{sorted(unknown)[0]}'; there is [shortcuts] and [[app]]")
-    if not isinstance(raw.get("shortcuts", {}), dict) or not isinstance(raw.get("app", []), list):
-        raise ConfigError("shortcuts go in a [shortcuts] table and each app in its own [[app]] table")
+        raise ConfigError(f"unknown section '{sorted(unknown)[0]}'; there is [shortcuts], [picker] and [[app]]")
+    if (not isinstance(raw.get("shortcuts", {}), dict) or not isinstance(raw.get("picker", {}), dict)
+            or not isinstance(raw.get("app", []), list)):
+        raise ConfigError("shortcuts go in a [shortcuts] table, picker settings in a [picker] table "
+                          "and each app in its own [[app]] table")
 
     shortcuts = dict(DEFAULT_SHORTCUTS)
     for key, value in raw.get("shortcuts", {}).items():
@@ -155,6 +183,14 @@ def load_config(path):
         if not isinstance(value, str):
             raise ConfigError(f"[shortcuts] {key} must be text such as \"Meta+H\", or \"\" for none")
         shortcuts[key] = value
+
+    picker = {"view": "list"}
+    for key, value in raw.get("picker", {}).items():
+        if key != "view":
+            raise ConfigError(f"[picker] has no '{key}'; the only key is view")
+        if value not in PICKER_VIEWS:
+            raise ConfigError('[picker] view must be "list" or "grid"')
+        picker[key] = value
 
     apps = []
     for number, entry in enumerate(raw.get("app", []), start=1):
@@ -185,7 +221,7 @@ def load_config(path):
             "autostash": bool(entry.get("autostash", False)),
             "command": command,
         })
-    return {"shortcuts": shortcuts, "apps": apps}
+    return {"shortcuts": shortcuts, "picker": picker, "apps": apps}
 
 
 def call(service, path, interface, method, *args, block=True, timeout=3000):
@@ -245,55 +281,597 @@ def title_of(window):
     return window["caption"] or window["app"] or window["cls"] or "Untitled window"
 
 
+class Thumbnails(QObject):
+    """Pictures of windows for the grid, taken one at a time by KWin's screenshot interface."""
+
+    changed = pyqtSignal(str)  # the id of the window that has a new picture
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.images = {}       # window id -> QImage, already scaled down
+        self.queue = deque()   # window ids waiting their turn
+        self.current = None    # the window id being captured
+        self.pipe = None       # read end of the pipe KWin writes the picture to
+        self.notifier = None
+        self.shape = None      # width, height, bytes per row and pixel format of that picture
+        self.data = bytearray()
+        self.stale = False     # the window being captured was shown again meanwhile
+        self.failed = set()    # window ids KWin had no picture for
+        self.refused = False   # KWin will not take pictures for us
+        self.warned = False
+        self.timeout = QTimer(self, singleShot=True, interval=5000)
+        self.timeout.timeout.connect(self.finish)
+
+    def request(self, window_ids, again=True):
+        """Take these windows' pictures. Without `again`, only of those not tried yet."""
+        if self.refused:
+            return
+        for window_id in window_ids:
+            if not again and (window_id in self.images or window_id in self.failed):
+                continue
+            if (window_id != self.current or self.stale) and window_id not in self.queue:
+                self.queue.append(window_id)
+        self.capture_next()
+
+    def keep(self, window_ids):
+        """Forget every window that is not one of these."""
+        window_ids = set(window_ids)
+        self.images = {key: image for key, image in self.images.items() if key in window_ids}
+        self.queue = deque(window_id for window_id in self.queue if window_id in window_ids)
+        self.failed &= window_ids
+        if self.current is not None and self.current not in window_ids:
+            self.stale = True  # its picture, still on the way, is of the window as it was
+
+    def capture_next(self):
+        if self.current is not None or not self.queue:
+            return
+        self.current = self.queue.popleft()
+        self.pipe, write_end = os.pipe()
+        try:
+            fcntl.fcntl(self.pipe, fcntl.F_SETPIPE_SZ, 1 << 20)  # a picture is tens of megabytes
+        except OSError:
+            pass
+        bus = QDBusConnection.sessionBus()  # before the message: PyQt needs it to type the arguments
+        message = QDBusMessage.createMethodCall(SHOTS, SHOTS_OBJECT, SHOTS, "CaptureWindow")
+        message.setArguments([self.current, {"include-decoration": False, "include-shadow": False},
+                              QDBusUnixFileDescriptor(write_end)])
+        os.close(write_end)  # the message carries its own copy
+        watcher = QDBusPendingCallWatcher(bus.asyncCall(message, 5000), self)
+        watcher.finished.connect(self.on_reply)
+
+    def on_reply(self, watcher):
+        reply = QDBusPendingReply(watcher).reply()
+        watcher.deleteLater()
+        if reply.type() == QDBusMessage.MessageType.ErrorMessage:
+            if reply.errorName() not in SHOTS_PASSING_ERRORS:
+                # Plasma before 6.8 only takes screenshots for apps on its own list.
+                self.refused = True
+                self.queue.clear()
+                if not self.warned:
+                    self.warned = True
+                    print("kdepad: no window thumbnails, the grid shows app icons instead: "
+                          f"{reply.errorMessage()}", file=sys.stderr)
+            self.finish()
+            return
+        try:
+            info = reply.arguments()[0]
+            self.shape = tuple(int(info[key]) for key in ("width", "height", "stride", "format"))
+            QImage.Format(self.shape[3])
+        except (IndexError, KeyError, TypeError, ValueError):
+            self.finish()
+            return
+        # KWin writes the pixels to the pipe after it has answered.
+        os.set_blocking(self.pipe, False)
+        self.notifier = QSocketNotifier(self.pipe, QSocketNotifier.Type.Read, self)
+        self.notifier.activated.connect(self.on_readable)
+        self.timeout.start()
+
+    def on_readable(self):
+        width, height, stride, pixel_format = self.shape
+        size = stride * height
+        try:
+            while len(self.data) < size:
+                chunk = os.read(self.pipe, 1 << 20)
+                if not chunk:
+                    break
+                self.data += chunk
+        except BlockingIOError:
+            return  # the rest is still to come
+        except OSError:
+            pass
+        image = None
+        if 0 < size <= len(self.data):
+            image = QImage(bytes(self.data[:size]), width, height, stride, QImage.Format(pixel_format))
+            sharpest = max((screen.devicePixelRatio() for screen in QApplication.screens()), default=1.0)
+            limit = thumb_size(THUMB_WIDTHS[2]) * sharpest
+            if image.width() > limit.width() or image.height() > limit.height():
+                image = image.scaled(limit, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation)
+            else:
+                image = image.copy()  # its own pixels, not the buffer read above
+        self.finish(image)
+
+    def finish(self, image=None):
+        window_id, self.current = self.current, None
+        self.timeout.stop()
+        if self.notifier:
+            self.notifier.setEnabled(False)
+            self.notifier.deleteLater()
+            self.notifier = None
+        if self.pipe is not None:
+            os.close(self.pipe)
+            self.pipe = None
+        self.data = bytearray()
+        stale, self.stale = self.stale, False
+        if stale:
+            pass
+        elif image is not None and not image.isNull():
+            self.failed.discard(window_id)
+            self.images[window_id] = image
+            self.changed.emit(window_id)
+        elif not self.refused:
+            self.failed.add(window_id)
+        self.capture_next()
+
+
+def thumb_size(width):
+    return QSize(width, width * 5 // 8)
+
+
+def faded(color, alpha):
+    color = QColor(color)
+    color.setAlpha(alpha)
+    return color
+
+
+class Cards(QStyledItemDelegate):
+    """Draws the picker's windows: a card with a thumbnail in the grid, a row in the list."""
+
+    ROW = 48  # the height of a window in the list
+
+    def __init__(self, picker):
+        super().__init__(picker)
+        self.picker = picker
+
+    def sizeHint(self, option, index):
+        return self.picker.cell() if self.picker.view == "grid" else QSize(0, self.ROW)
+
+    def paint(self, painter, option, index):
+        window = self.picker.by_id.get(index.data(Qt.ItemDataRole.UserRole))
+        if not window:
+            return
+        grid = self.picker.view == "grid"
+        text = option.palette.color(QPalette.ColorRole.WindowText)
+        accent = option.palette.color(QPalette.ColorRole.Highlight)
+        if grid:  # the card keeps its size where the cell is stretched to fill the row
+            card = QRectF(0, 0, self.picker.cell().width() - 8, option.rect.height() - 8)
+            card.moveCenter(QRectF(option.rect).center())
+        else:
+            card = QRectF(option.rect).adjusted(2, 2, -2, -2)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.setPen(QPen(accent, 2))
+            painter.setBrush(faded(accent, 60))
+            painter.drawRoundedRect(card.adjusted(1, 1, -1, -1), 10, 10)
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(faded(text, 22))
+            painter.drawRoundedRect(card, 10, 10)
+        painter.setPen(text)
+        if grid:
+            self.paint_card(painter, option, card, window, text)
+        else:
+            self.paint_row(painter, option, card, window, text)
+        painter.restore()
+
+    def paint_card(self, painter, option, card, window, text):
+        metrics = option.fontMetrics
+        box = QRectF(0, 0, self.picker.thumb_width, thumb_size(self.picker.thumb_width).height())
+        box.moveCenter(card.center())
+        box.moveTop(card.top() + 10)
+        pixmap = self.picker.thumbnail(window, box.size().toSize())
+        if pixmap:
+            size = pixmap.deviceIndependentSize()
+            painter.drawPixmap(QPointF(box.center().x() - size.width() / 2,
+                                       box.center().y() - size.height() / 2), pixmap)
+        else:  # no picture (yet): the app icon on a quiet backdrop
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(faded(text, 16))
+            painter.drawRoundedRect(box, 8, 8)
+            painter.restore()
+            side = int(min(96, box.height() * 0.5))
+            badge = QRect(0, 0, side, side)
+            badge.moveCenter(box.center().toPoint())
+            icon_for(window).paint(painter, badge)
+        # Under it, the app icon and the title, centred as one.
+        lead = 24 if pixmap else 0
+        line = QRectF(card.left() + 10, box.bottom() + 8, card.width() - 20, card.bottom() - box.bottom() - 16)
+        title = metrics.elidedText(title_of(window), Qt.TextElideMode.ElideRight, int(line.width() - lead))
+        left = line.center().x() - (lead + metrics.horizontalAdvance(title)) / 2
+        if pixmap:
+            icon_for(window).paint(painter, QRect(int(left), int(line.center().y() - 9), 18, 18))
+        painter.drawText(QRectF(left + lead, line.top(), line.right() - left - lead, line.height()),
+                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, title)
+
+    def paint_row(self, painter, option, card, window, text):
+        metrics = option.fontMetrics
+        icon_for(window).paint(painter, QRect(int(card.left() + 10), int(card.center().y() - 14), 28, 28))
+        line = card.adjusted(50, 0, -12, 0)
+        title = title_of(window)
+        app = window["app"] or window["cls"]
+        if app and app != title:  # which app it is, quietly, at the far end
+            app = metrics.elidedText(app, Qt.TextElideMode.ElideRight, int(line.width() * 0.3))
+            painter.save()
+            painter.setPen(faded(text, 140))
+            painter.drawText(line, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, app)
+            painter.restore()
+            line.setRight(line.right() - metrics.horizontalAdvance(app) - 16)
+        painter.drawText(line, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                         metrics.elidedText(title, Qt.TextElideMode.ElideRight, int(line.width())))
+
+
 class Picker(QWidget):
-    """A type-to-filter list of the hidden windows."""
+    """The hidden windows to pick from: a type-to-filter list, or a grid of thumbnails."""
 
     chosen = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, thumbnails):
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
                          | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle("kdepad")
-        self.setObjectName("picker")
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
-        self.setStyleSheet("#picker { border: 1px solid palette(mid); }")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # for round corners and a shadow
+        self.setMouseTracking(True)
+        self.setMinimumHeight(300 + 2 * SHADOW)
         self.windows = []
+        self.by_id = {}
         self.hint = ""
+        self.view = "list"
+        self.pixmaps = {}  # window id -> (what it was drawn from, pixmap): thumbnails as the grid shows them
+        self.thumbnails = thumbnails
+        thumbnails.changed.connect(self.on_thumbnail)
+
+        # What you changed by hand is kept between runs.
+        try:
+            kept = json.loads(STATE_PATH.read_text())
+        except (OSError, ValueError):
+            kept = {}
+        kept = kept if isinstance(kept, dict) else {}
+        sizes = kept.get("sizes") if isinstance(kept.get("sizes"), dict) else {}
+        self.sizes = {view: QSize(*size) for view, size in sizes.items()
+                      if view in PICKER_VIEWS and isinstance(size, list) and len(size) == 2
+                      and all(type(side) is int and 0 < side < 1 << 15 for side in size)}
+        self.dragged = False    # you resized the picker since it was last given a size
+        self.switching = False  # between hiding one view and being shown again as the other
+        self.wheel = 0          # Ctrl+scroll not yet amounting to a step
+        width = kept.get("thumbnail")
+        self.thumb_width = THUMB_WIDTHS[1]
+        if type(width) is int:
+            self.thumb_width = max(THUMB_WIDTHS[0], min(THUMB_WIDTHS[2], width))
+        self.saved = self.state()
 
         self.filter = QLineEdit()
-        self.filter.setPlaceholderText("Type to filter hidden windows")
+        self.filter.setPlaceholderText("Search hidden windows")
+        self.filter.setFrame(False)
         self.filter.setClearButtonEnabled(True)
+        font = self.filter.font()
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(font.pointSizeF() * 1.2)
+            self.filter.setFont(font)
+        for name in ("search", "edit-find", "system-search"):
+            if QIcon.hasThemeIcon(name):
+                self.filter.addAction(QIcon.fromTheme(name), QLineEdit.ActionPosition.LeadingPosition)
+                break
         self.filter.textChanged.connect(self.fill)
         self.filter.installEventFilter(self)
 
+        self.switch = QToolButton()
+        self.switch.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.switch.clicked.connect(self.switch_view)
+
+        self.rule = QFrame()
+        self.rule.setObjectName("rule")
+        self.rule.setFixedHeight(1)
+
         self.list = QListWidget()
-        self.list.setIconSize(QSize(32, 32))
+        self.list.setFrameShape(QFrame.Shape.NoFrame)
         self.list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.list.setMouseTracking(True)  # for the hover highlight
+        self.list.setItemDelegate(Cards(self))
+        self.list.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.itemClicked.connect(self.choose)
+        self.list.installEventFilter(self)
+        self.list.viewport().installEventFilter(self)
 
         self.empty = QLabel()
+        self.empty.setObjectName("empty")
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty.setWordWrap(True)
 
+        self.hints = QLabel()
+        self.hints.setObjectName("hints")
+        font = self.hints.font()
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(font.pointSizeF() * 0.9)
+            self.hints.setFont(font)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(THUMB_WIDTHS[0], THUMB_WIDTHS[2])
+        self.slider.setSingleStep(THUMB_STEP)
+        self.slider.setPageStep(2 * THUMB_STEP)
+        self.slider.setValue(self.thumb_width)
+        self.slider.setFixedWidth(130)
+        self.slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.slider.setToolTip("Thumbnail size (Ctrl+scroll)")
+        self.slider.valueChanged.connect(self.set_thumb_width)
+
+        # A child without a cursor of its own would show the resize arrows of the edge.
+        for widget in (self.switch, self.rule, self.list, self.list.viewport(), self.empty, self.hints, self.slider):
+            widget.setCursor(Qt.CursorShape.ArrowCursor)
+
+        self.top = QHBoxLayout()
+        self.top.setContentsMargins(16, 12, 12, 12)
+        self.top.addWidget(self.filter, 1)
+        self.top.addWidget(self.switch)
+        middle = QVBoxLayout()
+        middle.setContentsMargins(8, 8, 8, 0)
+        middle.addWidget(self.list, 1)
+        middle.addWidget(self.empty, 1)
+        self.bottom = QHBoxLayout()
+        self.bottom.setContentsMargins(18, 8, 16, 10)
+        self.bottom.addWidget(self.hints, 1)
+        self.bottom.addWidget(self.slider)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.addWidget(self.filter)
-        layout.addWidget(self.list, 1)
-        layout.addWidget(self.empty, 1)
-        self.resize(560, 420)
+        layout.setContentsMargins(SHADOW, SHADOW, SHADOW, SHADOW)
+        layout.setSpacing(0)
+        layout.addLayout(self.top)
+        layout.addWidget(self.rule)
+        layout.addLayout(middle, 1)
+        layout.addLayout(self.bottom)
+        self.restyle()
+        self.set_view(self.view)
+
+    # --- how it looks ----------------------------------------------------------
+
+    def restyle(self):
+        """Colours come from the desktop's own, so the picker is dark where the desktop is."""
+        text = self.palette().color(QPalette.ColorRole.WindowText)
+        accent = self.palette().color(QPalette.ColorRole.Highlight).name()
+
+        def quiet(alpha):
+            return f"rgba({text.red()}, {text.green()}, {text.blue()}, {alpha})"
+
+        self.setStyleSheet(f"""
+            QLineEdit {{ background: transparent; border: none; padding: 4px 2px; }}
+            QListWidget {{ background: transparent; border: none; outline: none; }}
+            QLabel#hints, QLabel#empty {{ color: {quiet(150)}; }}
+            QFrame#rule {{ background: {quiet(28)}; border: none; }}
+            QToolButton {{ border: none; border-radius: 6px; padding: 6px; }}
+            QToolButton:hover {{ background: {quiet(26)}; }}
+            QToolButton:pressed {{ background: {quiet(44)}; }}
+            QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
+            QScrollBar::handle:vertical {{ background: {quiet(70)}; border-radius: 3px; min-height: 32px; }}
+            QScrollBar::handle:vertical:hover {{ background: {quiet(120)}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+            QSlider::groove:horizontal {{ height: 4px; border-radius: 2px; background: {quiet(50)}; }}
+            QSlider::sub-page:horizontal {{ border-radius: 2px; background: {accent}; }}
+            QSlider::handle:horizontal {{ width: 14px; height: 14px; margin: -5px 0; border-radius: 7px;
+                                          background: {accent}; }}
+        """)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        panel = QRectF(self.rect()).adjusted(SHADOW, SHADOW, -SHADOW, -SHADOW)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for step in range(SHADOW):  # the shadow: rings that fade with distance, a little lower than the panel
+            painter.setPen(QPen(QColor(0, 0, 0, round(34 * (1 - step / SHADOW) ** 2)), 1))
+            painter.drawRoundedRect(panel.adjusted(-step, 3 - step, step, 3 + step), 12 + step, 12 + step)
+        painter.setPen(QPen(faded(self.palette().color(QPalette.ColorRole.WindowText), 50), 1))
+        painter.setBrush(self.palette().color(QPalette.ColorRole.Window))
+        painter.drawRoundedRect(panel.adjusted(0.5, 0.5, -0.5, -0.5), 12, 12)
+
+    def cell(self):
+        """The least room one window takes in the grid."""
+        thumb = thumb_size(self.thumb_width)
+        return QSize(thumb.width() + 28, thumb.height() + max(self.fontMetrics().height(), 18) + 36)
+
+    def bar_room(self):
+        """The width a grid loses to its scroll bar: QListView leaves that out whether the bar shows or not."""
+        style, bar = self.list.style(), self.list.verticalScrollBar()
+        if style.pixelMetric(QStyle.PixelMetric.PM_ScrollView_ScrollBarOverlap, None, bar):
+            return 0
+        return style.pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent, None, bar)
+
+    def relayout(self):
+        """Spread the grid's columns over the width there is."""
+        if self.view == "grid":
+            # One short of the width, or the last column of an exact fit wraps.
+            width = self.list.maximumViewportSize().width() - self.bar_room() - 1
+            columns = max(1, width // self.cell().width())
+            self.list.setGridSize(QSize(max(self.cell().width(), width // columns), self.cell().height()))
+        else:
+            self.list.setGridSize(QSize())
+        self.setMinimumWidth(max(420, self.one_column()) + 2 * SHADOW)
+
+    def one_column(self):
+        """The panel width that fits the grid's widest row of one. Nothing for the list."""
+        return self.cell().width() + self.bar_room() + 1 + 16 if self.view == "grid" else 0
+
+    def thumbnail(self, window, box):
+        """The window's picture with round corners, to fit the box. None when there is no picture."""
+        image = self.thumbnails.images.get(window["id"])
+        if image is None:
+            return None
+        ratio = self.devicePixelRatioF()
+        source = (image.cacheKey(), box.width(), box.height(), ratio)
+        cached = self.pixmaps.get(window["id"])
+        if not cached or cached[0] != source:
+            size = image.size() / ratio  # never larger than it is
+            if size.width() > box.width() or size.height() > box.height():
+                size = size.scaled(box, Qt.AspectRatioMode.KeepAspectRatio)
+            pixmap = QPixmap(size * ratio)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(Qt.GlobalColor.black)
+            painter.drawRoundedRect(QRectF(pixmap.rect()), 8 * ratio, 8 * ratio)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            painter.drawImage(0, 0, image.scaled(pixmap.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
+                                                 Qt.TransformationMode.SmoothTransformation))
+            painter.end()
+            pixmap.setDevicePixelRatio(ratio)
+            cached = self.pixmaps[window["id"]] = (source, pixmap)
+        return cached[1]
+
+    def on_thumbnail(self, window_id):
+        if self.view == "grid":
+            self.list.viewport().update()
+
+    # --- its size, and the thumbnails' -----------------------------------------
+
+    def state(self):
+        return {"sizes": {view: [size.width(), size.height()] for view, size in self.sizes.items()},
+                "thumbnail": self.thumb_width}
+
+    def remember(self):
+        """Keep the size the picker was dragged to, and the thumbnail size, for next time."""
+        if self.dragged:  # not a size the window manager pressed on it
+            self.sizes[self.view] = self.size()
+            self.dragged = False
+        if self.state() != self.saved:
+            try:
+                STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                STATE_PATH.write_text(json.dumps(self.state()))
+                self.saved = self.state()
+            except OSError:
+                pass
+
+    def wanted_size(self):
+        size = self.sizes.get(self.view)
+        if size is None and self.view == "list":
+            size = QSize(600 + 2 * SHADOW, 460 + 2 * SHADOW)
+        elif size is None:  # three thumbnails across and two down
+            around = self.top.sizeHint().height() + self.bottom.sizeHint().height() + 1 + 8 + 2 * SHADOW
+            size = QSize(self.one_column() + 2 * self.cell().width() + 2 * SHADOW,
+                         2 * self.cell().height() + around)
+        screen = self.screen() or QApplication.primaryScreen()
+        return size.boundedTo(screen.availableGeometry().size() * 0.95) if screen else size
+
+    def fit(self):
+        self.resize(self.wanted_size())
+        self.dragged = False
+
+    def set_thumb_width(self, width):
+        width = max(THUMB_WIDTHS[0], min(THUMB_WIDTHS[2], width))
+        if width != self.thumb_width:
+            self.thumb_width = width
+            self.slider.setValue(width)
+            self.relayout()
+            if self.list.currentItem():
+                self.list.scrollToItem(self.list.currentItem())
+
+    def edges_at(self, position):
+        """The edges a press here would drag: the shadow around the panel is its resize border."""
+        x, y, width, height = position.x(), position.y(), self.width(), self.height()
+        edges = Qt.Edge(0)
+        if SHADOW <= x < width - SHADOW and SHADOW <= y < height - SHADOW:
+            return edges
+        reach = SHADOW + 12  # near a corner, both edges
+        if x < reach:
+            edges |= Qt.Edge.LeftEdge
+        elif x >= width - reach:
+            edges |= Qt.Edge.RightEdge
+        if y < reach:
+            edges |= Qt.Edge.TopEdge
+        elif y >= height - reach:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def mouseMoveEvent(self, event):
+        if not event.buttons():
+            cursor = RESIZE_CURSORS.get(self.edges_at(event.position().toPoint()))
+            if cursor is None:
+                self.unsetCursor()
+            else:
+                self.setCursor(cursor)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        edges = self.edges_at(event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton and edges and self.windowHandle():
+            # The window manager takes the drag from here.
+            self.dragged = self.windowHandle().startSystemResize(edges) or self.dragged
+        super().mousePressEvent(event)
+
+    def hideEvent(self, event):
+        self.remember()
+        super().hideEvent(event)
+
+    # --- what it shows ---------------------------------------------------------
 
     def open(self, windows, hint):
         self.hint = hint
         self.filter.clear()
+        self.restyle()
         self.set_windows(windows)
+        self.fit()
         self.show()
         self.raise_()
         self.activateWindow()
         self.filter.setFocus()
+        self.take_pictures()
 
     def set_windows(self, windows):
         self.windows = windows
+        self.by_id = {window["id"]: window for window in windows}
+        self.pixmaps = {key: pixmap for key, pixmap in self.pixmaps.items() if key in self.by_id}
         self.fill()
+
+    def set_view(self, view):
+        if self.isVisible():
+            self.remember()
+        self.view = view
+        grid = view == "grid"
+        other = "list" if grid else "grid"
+        icon = QIcon.fromTheme("view-list-details" if grid else "view-grid",
+                               QIcon.fromTheme("view-list-symbolic" if grid else "view-grid-symbolic"))
+        self.switch.setIcon(icon)
+        self.switch.setText(other.capitalize())
+        self.switch.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly if icon.isNull()
+                                       else Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.switch.setToolTip(f"Show a {other} (Ctrl+G)")
+        keys = ["Enter  show", f"Ctrl+G  {other}"] + (["Ctrl+scroll  thumbnail size"] if grid else [])
+        self.hints.setText("     ".join(keys))
+        self.slider.setVisible(grid)
+        self.list.setViewMode(QListView.ViewMode.IconMode if grid else QListView.ViewMode.ListMode)
+        self.list.setMovement(QListView.Movement.Static)  # changing the view mode makes items draggable
+        self.list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.fit()
+        self.relayout()
+        self.fill()
+
+    def switch_view(self):
+        self.set_view("list" if self.view == "grid" else "grid")
+        if self.isVisible():
+            # A window cannot move itself on Wayland; shown again at its new
+            # size, KWin places it afresh. Word that the old one lost the focus
+            # can come after that, and must not close the new one.
+            self.switching = True
+            QTimer.singleShot(1000, lambda: setattr(self, "switching", False))
+            self.hide()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self.filter.setFocus()
+            self.take_pictures()
+
+    def take_pictures(self):
+        if self.view == "grid":
+            self.thumbnails.request(window["id"] for window in self.windows)
 
     def fill(self):
         words = self.filter.text().lower().split()
@@ -303,9 +881,9 @@ class Picker(QWidget):
         for window in self.windows:
             haystack = " ".join((window["caption"], window["cls"], window["app"])).lower()
             if all(word in haystack for word in words):
-                item = QListWidgetItem(icon_for(window), title_of(window))
+                item = QListWidgetItem(title_of(window))  # drawn by Cards
                 item.setData(Qt.ItemDataRole.UserRole, window["id"])
-                item.setToolTip(window["cls"])
+                item.setToolTip(title_of(window))
                 self.list.addItem(item)
                 if window["id"] == keep:
                     self.list.setCurrentItem(item)
@@ -322,9 +900,25 @@ class Picker(QWidget):
             self.chosen.emit(item.data(Qt.ItemDataRole.UserRole))
 
     def eventFilter(self, watched, event):
-        if watched is self.filter and event.type() == QEvent.Type.KeyPress:
+        control = Qt.KeyboardModifier.ControlModifier
+        if watched is self.list:
+            if event.type() == QEvent.Type.Resize:
+                self.relayout()
+        elif watched is self.list.viewport():
+            if event.type() == QEvent.Type.Wheel and event.modifiers() & control and self.view == "grid":
+                # A step per notch: touchpads and smooth wheels send a notch in many small parts.
+                self.wheel += event.angleDelta().y()
+                steps = int(self.wheel / 120)
+                if steps:
+                    self.wheel -= steps * 120
+                    self.set_thumb_width(self.thumb_width + steps * THUMB_STEP)
+                return True
+        elif watched is self.filter and event.type() == QEvent.Type.KeyPress:
             key = event.key()
-            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+            moves = [Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown]
+            if self.view == "grid":
+                moves += [Qt.Key.Key_Left, Qt.Key.Key_Right]
+            if key in moves:
                 QApplication.sendEvent(self.list, event)
                 return True
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -333,11 +927,24 @@ class Picker(QWidget):
             if key == Qt.Key.Key_Escape:
                 self.hide()
                 return True
+            if event.modifiers() & control:
+                if key == Qt.Key.Key_G:
+                    self.switch_view()
+                    return True
+                larger, smaller = self.thumb_width + THUMB_STEP, self.thumb_width - THUMB_STEP
+                sizes = {Qt.Key.Key_Plus: larger, Qt.Key.Key_Equal: larger, Qt.Key.Key_Minus: smaller,
+                         Qt.Key.Key_0: THUMB_WIDTHS[1]}
+                if key in sizes and self.view == "grid":
+                    self.set_thumb_width(sizes[key])
+                    return True
         return super().eventFilter(watched, event)
 
     def changeEvent(self, event):
-        if event.type() == QEvent.Type.ActivationChange and self.isVisible() and not self.isActiveWindow():
-            QTimer.singleShot(0, self.hide)
+        if event.type() == QEvent.Type.ActivationChange and self.isVisible():
+            if self.isActiveWindow():
+                self.switching = False
+            elif not self.switching:
+                QTimer.singleShot(0, self.hide)
         super().changeEvent(event)
 
 
@@ -386,7 +993,7 @@ class Daemon(QObject):
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.config = {"shortcuts": dict(DEFAULT_SHORTCUTS), "apps": []}
+        self.config = {"shortcuts": dict(DEFAULT_SHORTCUTS), "picker": {"view": "list"}, "apps": []}
         self.windows = []
         self.commands = deque()
         self.script_file = None
@@ -395,7 +1002,8 @@ class Daemon(QObject):
         self.recovered = False
         self.quitting = False
 
-        self.picker = Picker()
+        self.thumbnails = Thumbnails(self)
+        self.picker = Picker(self.thumbnails)
         self.picker.chosen.connect(self.show_window)
 
         self.menu = QMenu()
@@ -422,6 +1030,7 @@ class Daemon(QObject):
             self.config = load_config(CONFIG_PATH)
         except ConfigError as error:
             self.warn(f"Config ignored: {error}")
+        self.picker.set_view(self.config["picker"]["view"])
         self.refresh()
         self.show_tray()
         if bus.interface().isServiceRegistered("org.kde.KWin").value():
@@ -475,6 +1084,10 @@ class Daemon(QObject):
         self.menu.addAction("Quit kdepad", self.quit)
         count = len(hidden)
         self.tray.setToolTip(f"kdepad: {count} hidden window{'' if count == 1 else 's'}")
+        self.thumbnails.keep(window["id"] for window in hidden)
+        if self.picker.view == "grid":
+            # Taken as soon as a window is hidden, so the grid has it when it opens.
+            self.thumbnails.request((window["id"] for window in hidden), again=False)
         if self.picker.isVisible():
             self.picker.set_windows(hidden)
 
@@ -522,6 +1135,7 @@ class Daemon(QObject):
             self.warn(f"Could not prepare the KWin script: {error}")
             return
         self.script_seen = False
+        self.thumbnails.refused = False  # a restarted KWin may answer differently
         try:
             kwin_scripting("unloadScript", PLUGIN)
         except BusError as error:
@@ -599,12 +1213,15 @@ class Daemon(QObject):
         self.send(op="show", id=window_id)
 
     def reload(self):
+        before = self.config["picker"]["view"]
         try:
             self.config = load_config(CONFIG_PATH)
         except ConfigError as error:
             self.warn(f"Config not reloaded: {error}")
             return str(error)
         self.recovered = False
+        if self.config["picker"]["view"] != before:  # otherwise the view stays as Ctrl+G left it
+            self.picker.set_view(self.config["picker"]["view"])
         self.load_script()
         self.refresh()
         return ""
@@ -723,8 +1340,12 @@ def register():
 def uninstall():
     if daemon_running():
         call(SERVICE, OBJECT, SERVICE, "Quit")
-    for path in (LAUNCHER, AUTOSTART):
+    for path in (LAUNCHER, AUTOSTART, STATE_PATH):
         path.unlink(missing_ok=True)
+    try:
+        STATE_PATH.parent.rmdir()
+    except OSError:
+        pass
     if BIN_LINK.is_symlink():
         BIN_LINK.unlink()
     print(f"kdepad no longer starts at login. Left in place: {ME} and {CONFIG_PATH}\n"
@@ -751,9 +1372,15 @@ default keys (change them in the config):
 The tray icon does the same with the mouse. A window you bring back lands on
 the desktop you are on. Quitting kdepad brings every hidden window back.
 
+The list of hidden windows can also be a larger grid of window thumbnails;
+Ctrl+G switches between the two. In the grid, Ctrl+scroll, Ctrl+plus and
+Ctrl+minus change the thumbnail size (Ctrl+0 puts it back). Dragging the
+picker's edge resizes it. Both sizes are remembered.
+
 Config: ~/.config/kdepad/config.toml (tray menu > Edit config). It also sets
-per-app show/hide keys and apps that hide as soon as they open. A key that
-another shortcut already owns is silently not assigned; pick another one.
+whether kdepad starts with the list or the grid, per-app show/hide keys and
+apps that hide as soon as they open. A key that another shortcut already owns
+is silently not assigned; pick another one.
 Script errors: journalctl --user -b | grep -i -e kdepad -e kwin_scripting
 """
 
@@ -768,6 +1395,9 @@ DEFAULT_CONFIG = """\
 stash  = "Meta+H"        # hide the focused window
 picker = "Meta+Shift+H"  # list the hidden windows and pick one
 last   = "Meta+Ctrl+H"   # bring back the most recently hidden window
+
+[picker]
+view = "list"            # "grid" starts with a larger window of thumbnails; Ctrl+G switches
 
 # One [[app]] block per app that gets its own show/hide key.
 # Find `match` with `kdepad windows` while the app is open (the CLASS column).

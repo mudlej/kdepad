@@ -8,9 +8,20 @@ Alt+Tab, the pager and the Overview until you call it back.
 
 ## Screenshots
 
-| Picker | Tray menu |
-| :---: | :---: |
-| <img width="380" alt="The picker: a filter box above a list of three hidden windows" src="https://github.com/user-attachments/assets/e4587dc1-f184-4228-bbbd-608fd122e5b3" /> | <img width="380" alt="The tray menu: the hidden windows, then Bring everything back, Reload config, Edit config and Quit" src="https://github.com/user-attachments/assets/f27c5b64-5dd3-4ed7-83a2-702fd353acb0" /> |
+The picker, as a grid of thumbnails and as a list:
+
+<p align="center">
+  <img width="720" alt="The picker showing the hidden windows" src="https://github.com/user-attachments/assets/6a3885b9-fe00-46a8-af6a-0c74a610869f" />
+</p>
+<p align="center">
+  <img width="720" alt="The picker showing the hidden windows, in its other view" src="https://github.com/user-attachments/assets/37a93328-d7c5-470e-97b9-49d012726af5" />
+</p>
+
+The tray menu:
+
+<p align="center">
+  <img width="380" alt="The tray menu: the hidden windows, then Bring everything back, Reload config, Edit config and Quit" src="https://github.com/user-attachments/assets/f27c5b64-5dd3-4ed7-83a2-702fd353acb0" />
+</p>
 
 ## Install
 
@@ -38,6 +49,13 @@ kdepad to login autostart and the app launcher and puts `kdepad` on your PATH.
 The tray icon does the same with the mouse. A window you bring back lands on
 the desktop you are on. Quitting kdepad brings every hidden window back.
 
+The list can also be a larger grid with a thumbnail of each hidden window.
+`Ctrl+G`, or the button beside the search box, switches between the two, and
+the config sets which one kdepad starts with. In the grid, the slider at the
+bottom, `Ctrl+scroll`, `Ctrl++` and `Ctrl+-` change the thumbnail size
+(`Ctrl+0` puts it back). Drag the picker by its edge to resize it. kdepad
+remembers both sizes.
+
 ## Config
 
 `~/.config/kdepad/config.toml`, applied with `kdepad reload`:
@@ -47,6 +65,9 @@ the desktop you are on. Quitting kdepad brings every hidden window back.
 stash  = "Meta+H"
 picker = "Meta+Shift+H"
 last   = "Meta+Ctrl+H"
+
+[picker]
+view = "grid"           # thumbnails in a larger window; the default is "list"
 
 [[app]]
 name      = "Music"
@@ -72,6 +93,9 @@ kdepad uninstall  remove autostart, launcher entry and PATH link
 
 Plasma 6 only; it drives KWin directly, so it does not work on other desktops
 or on Plasma 5. Developed on Wayland.
+
+Thumbnails in the grid need Plasma 6.8 or newer. Older versions refuse to take
+them, and the grid shows app icons instead.
 
 ## License
 
