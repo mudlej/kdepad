@@ -47,7 +47,11 @@ kdepad to login autostart and the app launcher and puts `kdepad` on your PATH.
 | `Meta+Ctrl+H`  | Bring back the most recently hidden window     |
 
 The tray icon does the same with the mouse. A window you bring back lands on
-the desktop you are on. Quitting kdepad brings every hidden window back.
+the desktop you are on.
+
+Quitting kdepad brings every hidden window back, so nothing is out of reach
+while it is not running. Start it again before you log out, as you do when
+updating it, and it asks whether to hide the same windows again.
 
 The list can also be a larger grid with a thumbnail of each hidden window.
 `Ctrl+G`, or the button beside the search box, switches between the two, and

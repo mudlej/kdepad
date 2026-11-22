@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from collections import deque
 from pathlib import Path
@@ -106,12 +107,12 @@ try:
                               QDBusPendingReply, QDBusServiceWatcher, QDBusUnixFileDescriptor)
     from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
     from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
-                                 QListWidget, QListWidgetItem, QMenu, QSlider, QStyle, QStyledItemDelegate,
+                                 QListWidget, QListWidgetItem, QMenu, QMessageBox, QSlider, QStyle, QStyledItemDelegate,
                                  QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 except ImportError as error:
     offer_pyqt_install(error)
 
-VERSION = "0.2.0"  # a release is the tag v<VERSION> with this file attached
+VERSION = "0.3.0"  # a release is the tag v<VERSION> with this file attached
 SERVICE = "org.kdepad.Daemon"
 OBJECT = "/Daemon"
 PLUGIN = "kdepad"
@@ -125,6 +126,10 @@ LAUNCHER = DATA_HOME / "applications" / "kdepad.desktop"
 AUTOSTART = CONFIG_HOME / "autostart" / "kdepad.desktop"
 BIN_LINK = Path.home() / ".local/bin/kdepad"
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()) / "kdepad"
+# The windows that were hidden when kdepad last quit, for the next start to offer
+# to hide again. KWin's ids for them mean nothing after a logout, and the
+# runtime directory is gone by then too.
+REMEMBERED = RUNTIME_DIR / "hidden.json"
 
 DEFAULT_SHORTCUTS = {"stash": "Meta+H", "picker": "Meta+Shift+H", "last": "Meta+Ctrl+H"}
 SHORTCUT_ACTIONS = {"stash": "kdepad_stash", "picker": "kdepad_picker", "last": "kdepad_last"}
@@ -240,6 +245,30 @@ def call(service, path, interface, method, *args, block=True, timeout=3000):
 
 def kwin_scripting(method, *args):
     return call("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", method, *args)
+
+
+def remember_hidden(window_ids):
+    try:
+        if window_ids:
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            REMEMBERED.write_text(json.dumps(window_ids))
+        else:
+            REMEMBERED.unlink(missing_ok=True)
+    except OSError as error:
+        print(f"kdepad: could not remember the hidden windows: {error}", file=sys.stderr)
+
+
+def recall_hidden():
+    """The windows that were hidden when kdepad last quit, oldest first. Answers once."""
+    try:
+        text = REMEMBERED.read_text()
+        REMEMBERED.unlink()
+        window_ids = json.loads(text)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(window_ids, list):
+        return []
+    return [window_id for window_id in window_ids if isinstance(window_id, str)]
 
 
 def desktop_file_icon(name):
@@ -995,6 +1024,8 @@ class Daemon(QObject):
         self.app = app
         self.config = {"shortcuts": dict(DEFAULT_SHORTCUTS), "picker": {"view": "list"}, "apps": []}
         self.windows = []
+        self.rehide = []  # the windows that were hidden at the last quit, until you have said what to do with them
+        self.prompt = None
         self.commands = deque()
         self.script_file = None
         self.script_seen = False
@@ -1031,6 +1062,7 @@ class Daemon(QObject):
         except ConfigError as error:
             self.warn(f"Config ignored: {error}")
         self.picker.set_view(self.config["picker"]["view"])
+        self.rehide = recall_hidden()
         self.refresh()
         self.show_tray()
         if bus.interface().isServiceRegistered("org.kde.KWin").value():
@@ -1208,6 +1240,43 @@ class Daemon(QObject):
         self.refresh()
         if self.quitting and not self.hidden():
             self.finish_quit()
+        elif self.rehide and not self.prompt and not self.quitting:
+            self.offer_rehide()
+
+    def offer_rehide(self):
+        """Ask whether the windows that were hidden at the last quit should be hidden again."""
+        on_show = {window["id"]: window for window in self.windows if not window["hidden"]}
+        self.rehide = [window_id for window_id in self.rehide if window_id in on_show]
+        if not self.rehide:  # closed since, or a new session
+            return
+        one = len(self.rehide) == 1
+        titles = [title_of(on_show[window_id]) for window_id in reversed(self.rehide)]
+        titles = [title if len(title) <= 60 else title[:59] + "…" for title in titles]
+        if len(titles) > 8:
+            titles[7:] = [f"and {len(titles) - 7} more"]
+        box = QMessageBox(QMessageBox.Icon.Question, "kdepad",
+                          "Hide this window again?" if one else f"Hide these {len(self.rehide)} windows again?")
+        box.setWindowIcon(QIcon.fromTheme("view-hidden"))
+        box.setInformativeText(("It was" if one else "They were") + " hidden when kdepad last quit:\n\n"
+                               + "\n".join(titles))
+        box.setTextFormat(Qt.TextFormat.PlainText)  # a title is not markup
+        again = box.addButton("Hide again", QMessageBox.ButtonRole.AcceptRole)
+        leave = box.addButton("Leave it" if one else "Leave them", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(again)
+        box.setEscapeButton(leave)
+        box.finished.connect(lambda: self.on_rehide_answer(box.clickedButton() is again))
+        self.prompt = box
+        box.show()
+
+    def on_rehide_answer(self, again):
+        if self.prompt:
+            self.prompt.deleteLater()
+            self.prompt = None
+        if self.quitting:  # not answered: the next start asks again
+            return
+        if again:
+            self.send(op="hide", ids=self.rehide)
+        self.rehide = []
 
     def show_window(self, window_id):
         self.send(op="show", id=window_id)
@@ -1227,11 +1296,14 @@ class Daemon(QObject):
         return ""
 
     def quit(self):
-        """Bring every hidden window back, then leave."""
+        """Bring every hidden window back, then leave. The next start offers to hide them again."""
         if self.quitting:
             return
         self.quitting = True
         self.picker.hide()
+        if self.prompt:
+            self.prompt.reject()
+        remember_hidden(self.rehide + [window["id"] for window in reversed(self.hidden())])
         if self.hidden():
             self.send(op="restore_all")
             QTimer.singleShot(1500, self.finish_quit)
@@ -1340,7 +1412,10 @@ def register():
 def uninstall():
     if daemon_running():
         call(SERVICE, OBJECT, SERVICE, "Quit")
-    for path in (LAUNCHER, AUTOSTART, STATE_PATH):
+        deadline = time.monotonic() + 5  # it brings its windows back and notes them down first
+        while daemon_running() and time.monotonic() < deadline:
+            time.sleep(0.1)
+    for path in (LAUNCHER, AUTOSTART, STATE_PATH, REMEMBERED):
         path.unlink(missing_ok=True)
     try:
         STATE_PATH.parent.rmdir()
@@ -1370,7 +1445,8 @@ default keys (change them in the config):
   Meta+Ctrl+H     bring back the most recently hidden window
 
 The tray icon does the same with the mouse. A window you bring back lands on
-the desktop you are on. Quitting kdepad brings every hidden window back.
+the desktop you are on. Quitting kdepad brings every hidden window back;
+started again before you log out, it asks whether to hide them again.
 
 The list of hidden windows can also be a larger grid of window thumbnails;
 Ctrl+G switches between the two. In the grid, Ctrl+scroll, Ctrl+plus and
@@ -1415,6 +1491,8 @@ view = "list"            # "grid" starts with a larger window of thumbnails; Ctr
 # hiding: a hidden window is minimized and flagged to skip the taskbar, the
 # pager and the window switcher. Those window properties are the only record of
 # "hidden", so a freshly loaded copy picks up windows hidden by an earlier one.
+# Quitting brings the windows back. The daemon notes which ones those were, and
+# when it starts again and you agree, has the script hide them (the "hide" command).
 KWIN_SCRIPT = r'''
 var CONFIG = __KDEPAD_CONFIG__;
 
@@ -1716,6 +1794,15 @@ function runCommands(json) {
             }
         } else if (command.op === "restore_all") {
             restoreAll();
+        } else if (command.op === "hide") {
+            // Oldest first, so that the last one hidden is still the last one.
+            command.ids.forEach(function (id) {
+                allWindows().forEach(function (w) {
+                    if (wid(w) === id) {
+                        hide(w);
+                    }
+                });
+            });
         }
     });
     publish();
